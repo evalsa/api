@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "evalsa-api-server"
+version = "0.1.0"
+description = ""
+authors = ["greenstar1151 <39073901+greenstar1151@users.noreply.github.com>"]
+license = "MIT"
+readme = "README.md"
+packages = [{include = "evalsa_api_server"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+fastapi = "^0.87.0"
+uvicorn = {extras = ["standard"], version = "^0.19.0"}
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
