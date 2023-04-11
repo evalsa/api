@@ -1,0 +1,9 @@
+[package]
+name = "evalsa-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.6.11"
+serde = { version = "1.0.156", features = ["derive"] }
+tokio = { version = "1.26.0", features = ["macros", "rt-multi-thread"] }
