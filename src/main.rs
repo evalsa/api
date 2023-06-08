@@ -27,15 +27,15 @@ struct AppState {
 #[tokio::main]
 async fn main() {
     let (run_tx, run_rx) = unbounded_channel();
-    let ids = Arc::new(Mutex::new(HashMap::new()));
-    let ids_clone = ids.clone();
-    tokio::task::spawn_blocking(move || poll(run_rx, ids_clone));
+    let finish_tx_list = Arc::new(Mutex::new(HashMap::new()));
+    let ftl = finish_tx_list.clone();
+    tokio::task::spawn_blocking(move || poll(run_rx, ftl));
     let app = Router::new()
         .route("/run/:language/:nonce", routing::post(post_run))
         .route("/notify/:id", routing::get(get_notify))
         .with_state(AppState {
             run_id: Arc::new(AtomicU32::new(0)),
-            finish_tx_list: Arc::new(Mutex::new(HashMap::new())),
+            finish_tx_list,
             finish_rx_queue: Arc::new(Mutex::new(HashMap::new())),
             run_tx,
         });
@@ -122,7 +122,7 @@ async fn get_notify(
 fn poll(mut rx: UnboundedReceiver<Run>, ids: Arc<Mutex<HashMap<u64, oneshot::Sender<Finished>>>>) {
     let ctx = zmq::Context::new();
     let socket = ctx.socket(zmq::REP).unwrap();
-    socket.bind("0.0.0.0:5000").unwrap();
+    socket.bind("tcp://0.0.0.0:5000").unwrap();
     let mut msg = zmq::Message::new();
     loop {
         socket.recv(&mut msg, 0).unwrap();
@@ -130,16 +130,23 @@ fn poll(mut rx: UnboundedReceiver<Run>, ids: Arc<Mutex<HashMap<u64, oneshot::Sen
         match apibound {
             ApiBound::Idle { languages: _ } => {
                 let Some(run) = rx.blocking_recv() else { return };
-                bincode::serialize_into(msg.as_mut(), &run).unwrap();
-                socket.send(msg.as_ref(), 0).unwrap();
+                let serialized = bincode::serialize(&run).unwrap();
+                socket.send(&serialized, 0).unwrap();
             }
-            ApiBound::Fetched => {}
-            ApiBound::Reject => {}
+            ApiBound::Fetched => {
+                socket.send([].as_slice(), 0).unwrap();
+            }
+            ApiBound::Reject { id } => {
+                let mut ids = ids.lock().unwrap();
+                ids.remove(&id);
+                socket.send([].as_slice(), 0).unwrap();
+            }
             ApiBound::Finished(finished) => {
                 let mut ids = ids.lock().unwrap();
                 if let Some(tx) = ids.remove(&finished.id) {
-                    tx.send(finished).ok(); // Silently Fail
+                    tx.send(finished).unwrap();
                 }
+                socket.send([].as_slice(), 0).unwrap();
             }
         }
     }
