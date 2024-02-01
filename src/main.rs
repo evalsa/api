@@ -1,153 +1,164 @@
 use std::{
     collections::HashMap,
-    sync::{atomic::AtomicU32, Arc, Mutex},
+    sync::{atomic::AtomicU64, Arc, Mutex},
 };
 
 use axum::{
-    extract::{ws, BodyStream, Path, State},
+    body::Bytes,
+    extract::{ws::Message, Path, State, WebSocketUpgrade},
     http::StatusCode,
-    response::Response,
+    response::{IntoResponse, Response},
     routing, Router,
 };
-use evalsa_worker_proto::{ApiBound, Finished, Run, RunResult};
+use evalsa_worker_proto::{Run, Running, RunningState};
 use futures_util::StreamExt;
-use tokio::sync::{
-    mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-    oneshot,
+use lapin::{
+    options::{BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, QueueDeclareOptions},
+    types::FieldTable,
+    BasicProperties, Connection,
 };
+use serde::Deserialize;
+use tokio::{select, sync::mpsc};
 
 #[derive(Clone)]
 struct AppState {
-    run_id: Arc<AtomicU32>,
-    finish_tx_list: Arc<Mutex<HashMap<u64, oneshot::Sender<Finished>>>>,
-    finish_rx_queue: Arc<Mutex<HashMap<u64, oneshot::Receiver<Finished>>>>,
-    run_tx: UnboundedSender<Run>,
+    run_id: Arc<AtomicU64>,
+    run_sender: mpsc::UnboundedSender<Run>,
+    run_subscribers: Arc<Mutex<HashMap<u64, mpsc::UnboundedReceiver<Running>>>>,
 }
 
 #[tokio::main]
 async fn main() {
-    let (run_tx, run_rx) = unbounded_channel();
-    let finish_tx_list = Arc::new(Mutex::new(HashMap::new()));
-    let ftl = finish_tx_list.clone();
-    tokio::task::spawn_blocking(move || poll(run_rx, ftl));
+    let (run_sender, run_receiver) = mpsc::unbounded_channel();
+    let run_subscribers = Arc::new(Mutex::new(HashMap::new()));
+    let state = AppState {
+        run_id: Arc::new(AtomicU64::new(0)),
+        run_sender,
+        run_subscribers: run_subscribers.clone(),
+    };
+    tokio::task::spawn(poll(run_receiver, run_subscribers));
     let app = Router::new()
-        .route("/run/:language/:nonce", routing::post(post_run))
+        .route("/run", routing::post(post_run))
         .route("/notify/:id", routing::get(get_notify))
-        .with_state(AppState {
-            run_id: Arc::new(AtomicU32::new(0)),
-            finish_tx_list,
-            finish_rx_queue: Arc::new(Mutex::new(HashMap::new())),
-            run_tx,
-        });
-    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:4000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
 
-async fn post_run(
-    Path((language, nonce)): Path<(String, u32)>,
-    State(state): State<AppState>,
-    mut body: BodyStream,
-) -> Result<String, StatusCode> {
-    if language != "rust" {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let mut bytes = vec![];
-    while let Some(chunk) = body.next().await {
-        let Ok(chunk) = chunk else {
-            return Err(StatusCode::BAD_REQUEST);
-        };
-        if bytes.len() + chunk.len() > 1024 * 1024 {
-            return Err(StatusCode::PAYLOAD_TOO_LARGE);
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    let Ok(code) = String::from_utf8(bytes) else {
-        return Err(StatusCode::BAD_REQUEST);
-    };
-    let id_upper = state
+#[derive(Deserialize)]
+struct RunBody {
+    language: String,
+    code: Vec<u8>,
+    stdin: Vec<u8>,
+}
+
+async fn post_run(State(state): State<AppState>, body: Bytes) -> String {
+    let run_body: RunBody = ciborium::from_reader(&*body).unwrap();
+    let id = state
         .run_id
-        .fetch_update(
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-            |x| Some(x.wrapping_add(1)),
-        )
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    state
+        .run_sender
+        .send(Run {
+            id,
+            language: run_body.language,
+            code: run_body.code,
+            stdin: run_body.stdin,
+        })
         .unwrap();
-    let id = (id_upper as u64) << 32 | nonce as u64;
-    let (tx, rx) = oneshot::channel();
-    {
-        let mut finish_tx_list = state.finish_tx_list.lock().unwrap();
-        finish_tx_list.insert(id, tx);
-        let mut finish_rx_queue = state.finish_rx_queue.lock().unwrap();
-        // TODO: Prevent queue saturation
-        finish_rx_queue.insert(id, rx);
-    }
-    let Ok(_) = state.run_tx.send(Run { id, language, code }) else {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    };
-    Ok(id.to_string())
+    id.to_string()
 }
 
 async fn get_notify(
-    Path(id): Path<u64>,
     State(state): State<AppState>,
-    ws: ws::WebSocketUpgrade,
-) -> Result<Response, StatusCode> {
-    if let Some(finish_rx) = state.finish_rx_queue.lock().unwrap().remove(&id) {
-        Ok(ws.on_upgrade(move |mut socket: ws::WebSocket| async {
-            if let Ok(finished) = finish_rx.await {
-                let mut message = vec![];
-                let result = match finished.result {
-                    RunResult::Success => 0u8,
-                    RunResult::Timeout => 1,
-                    RunResult::CompileError => 2,
-                    RunResult::RuntimeError => 3,
-                };
-                message.push(result);
-                message.extend(finished.exit_code.unwrap_or(0).to_le_bytes());
-                message.extend((finished.stderr.len() as u32).to_le_bytes());
-                message.extend(finished.stderr);
-                message.extend((finished.stdout.len() as u32).to_le_bytes());
-                message.extend(finished.stdout);
-                socket.send(ws::Message::Binary(message)).await.unwrap();
+    Path(id): Path<u64>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let mut subscribers = state.run_subscribers.lock().unwrap();
+    if let Some(mut subscriber) = subscribers.remove(&id) {
+        ws.on_upgrade(move |mut websocket| async move {
+            while let Some(event) = subscriber.recv().await {
+                let mut buffer = vec![];
+                ciborium::into_writer(&event, &mut buffer).unwrap();
+                websocket.send(Message::Binary(buffer)).await.unwrap();
             }
-            socket.close().await.ok();
-        }))
+        })
     } else {
-        Err(StatusCode::NOT_FOUND)
+        StatusCode::NOT_FOUND.into_response()
     }
 }
 
-fn poll(mut rx: UnboundedReceiver<Run>, ids: Arc<Mutex<HashMap<u64, oneshot::Sender<Finished>>>>) {
-    let ctx = zmq::Context::new();
-    let socket = ctx.socket(zmq::REP).unwrap();
-    socket.bind("tcp://0.0.0.0:5000").unwrap();
-    let mut msg = zmq::Message::new();
+async fn poll(
+    mut task: mpsc::UnboundedReceiver<Run>,
+    subscribers: Arc<Mutex<HashMap<u64, mpsc::UnboundedReceiver<Running>>>>,
+) {
+    let connection = Connection::connect(
+        "amqp://localhost:5672",
+        lapin::ConnectionProperties::default(),
+    )
+    .await
+    .unwrap();
+    let channel = connection.create_channel().await.unwrap();
+    channel
+        .queue_declare(
+            "apibound",
+            QueueDeclareOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+    channel
+        .queue_declare(
+            "workerbound",
+            QueueDeclareOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+    let mut consumer = channel
+        .basic_consume(
+            "apibound",
+            "api",
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+    let mut notifiers = HashMap::<u64, mpsc::UnboundedSender<Running>>::new();
     loop {
-        socket.recv(&mut msg, 0).unwrap();
-        let apibound: ApiBound = bincode::deserialize(msg.as_ref()).unwrap();
-        match apibound {
-            ApiBound::Idle { languages: _ } => {
-                let Some(run) = rx.blocking_recv() else { return };
-                let serialized = bincode::serialize(&run).unwrap();
-                socket.send(&serialized, 0).unwrap();
-            }
-            ApiBound::Fetched => {
-                socket.send([].as_slice(), 0).unwrap();
-            }
-            ApiBound::Reject { id } => {
-                let mut ids = ids.lock().unwrap();
-                ids.remove(&id);
-                socket.send([].as_slice(), 0).unwrap();
-            }
-            ApiBound::Finished(finished) => {
-                let mut ids = ids.lock().unwrap();
-                if let Some(tx) = ids.remove(&finished.id) {
-                    tx.send(finished).unwrap();
+        select! {
+            Some(running) = consumer.next() => {
+                let running = running.unwrap();
+                running.ack(BasicAckOptions::default()).await.unwrap();
+                let data: Running = ciborium::from_reader(running.data.as_slice()).unwrap();
+                if let std::collections::hash_map::Entry::Occupied(entry) = notifiers.entry(data.id) {
+                    let is_finished = matches!(data.state, RunningState::Finished(_));
+                    entry.get().send(data).unwrap();
+                    if is_finished {
+                        entry.remove();
+                    }
                 }
-                socket.send([].as_slice(), 0).unwrap();
             }
+            Some(run) = task.recv() => {
+                let mut workerbound = vec![];
+                ciborium::into_writer(&run, &mut workerbound).unwrap();
+                channel
+                    .basic_publish(
+                        "",
+                        "workerbound",
+                        BasicPublishOptions::default(),
+                        &workerbound,
+                        BasicProperties::default(),
+                    )
+                    .await
+                    .unwrap()
+                    .await
+                    .unwrap();
+                let (notifier, subscriber) = mpsc::unbounded_channel();
+                notifiers.insert(run.id, notifier);
+                subscribers.lock().unwrap().insert(run.id, subscriber);
+            }
+            else => break
         }
     }
 }
